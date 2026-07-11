@@ -196,6 +196,7 @@ func (e *XAIExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req 
 			}
 			completedData := xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 			completedData = xaiNormalizeReasoningSummaryData(completedData)
+			completedData = xaiPatchCompletedResponseRequestFields(completedData, prepared.originalPayload, prepared.from)
 			cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, completedData)
 			var param any
 			out := sdktranslator.TranslateNonStream(ctx, prepared.to, prepared.responseFormat, req.Model, prepared.originalPayload, prepared.body, completedData, &param)
@@ -676,6 +677,7 @@ func (e *XAIExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth
 						}
 						eventData = xaiPatchCompletedOutput(eventData, outputItemsByIndex, outputItemsFallback)
 						eventData = xaiNormalizeReasoningSummaryData(eventData)
+						eventData = xaiPatchCompletedResponseRequestFields(eventData, prepared.originalPayload, prepared.from)
 						cacheXAIReasoningReplayFromCompleted(ctx, prepared.replayScope, eventData)
 						normalizedEventName = gjson.GetBytes(eventData, "type").String()
 					}
@@ -848,6 +850,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body, _ = sjson.DeleteBytes(body, "stream_options")
 	body = normalizeXAITools(body)
 	body = normalizeXAIToolChoiceForTools(body)
+	body = restoreXAIResponsesSourceRequestFields(body, originalPayload, from)
 	var replayScope xaiReasoningReplayScope
 	body, replayScope, err = applyXAIReasoningReplayCacheRequired(ctx, from, req, opts, body)
 	if err != nil {
@@ -1121,7 +1124,7 @@ func xaiMetadataString(meta map[string]any, key string) string {
 }
 
 func sanitizeXAIResponsesBody(body []byte, model string) []byte {
-	body = removeXAIEncryptedReasoningInclude(body)
+	body = normalizeXAIResponsesInclude(body)
 	if !xaiSupportsReasoningEffort(model) {
 		if gjson.GetBytes(body, "reasoning.effort").Exists() {
 			log.Debugf("xai: stripping reasoning.effort for model %s (no thinking levels in model registry)", model)
@@ -1460,21 +1463,80 @@ func appendXAIReasoningSummary(previous json.RawMessage, currentSummary []gjson.
 	return updated, true
 }
 
-func removeXAIEncryptedReasoningInclude(body []byte) []byte {
+func restoreXAIResponsesSourceRequestFields(body, originalPayload []byte, from sdktranslator.Format) []byte {
+	if len(originalPayload) == 0 || !sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		return body
+	}
+	req := gjson.ParseBytes(originalPayload)
+	if store := req.Get("store"); store.Exists() {
+		updated, errSet := sjson.SetBytes(body, "store", store.Bool())
+		if errSet == nil {
+			body = updated
+		}
+	}
+	include := req.Get("include")
+	if include.Exists() && include.IsArray() {
+		normalized := normalizeXAIIncludeValues(include.Array())
+		updated, errSet := sjson.SetBytes(body, "include", normalized)
+		if errSet == nil {
+			body = updated
+		}
+	}
+	if !include.Exists() && gjson.GetBytes(body, "include").Exists() {
+		updated, errDel := sjson.DeleteBytes(body, "include")
+		if errDel == nil {
+			body = updated
+		}
+	}
+	return body
+}
+
+func normalizeXAIResponsesInclude(body []byte) []byte {
 	include := gjson.GetBytes(body, "include")
 	if !include.Exists() || !include.IsArray() {
 		return body
 	}
-	kept := make([]string, 0, len(include.Array()))
-	for _, item := range include.Array() {
-		value := strings.TrimSpace(item.String())
-		if value == "" || value == "reasoning.encrypted_content" {
-			continue
+	kept := normalizeXAIIncludeValues(include.Array())
+	if len(kept) == 0 {
+		updated, errDel := sjson.DeleteBytes(body, "include")
+		if errDel == nil {
+			return updated
 		}
-		kept = append(kept, value)
+		return body
 	}
 	body, _ = sjson.SetBytes(body, "include", kept)
 	return body
+}
+
+func normalizeXAIIncludeValues(items []gjson.Result) []string {
+	kept := make([]string, 0, len(items))
+	seen := make(map[string]bool, len(items))
+	for _, item := range items {
+		value := strings.TrimSpace(item.String())
+		if value == "" || seen[value] {
+			continue
+		}
+		kept = append(kept, value)
+		seen[value] = true
+	}
+	return kept
+}
+
+func xaiPatchCompletedResponseRequestFields(eventData, originalPayload []byte, from sdktranslator.Format) []byte {
+	if len(originalPayload) == 0 || !sourceFormatEqual(from, sdktranslator.FormatOpenAIResponse) {
+		return eventData
+	}
+	if gjson.GetBytes(eventData, "type").String() != "response.completed" {
+		return eventData
+	}
+	req := gjson.ParseBytes(originalPayload)
+	if store := req.Get("store"); store.Exists() {
+		updated, errSet := sjson.SetBytes(eventData, "response.store", store.Bool())
+		if errSet == nil {
+			eventData = updated
+		}
+	}
+	return eventData
 }
 
 // xaiSupportsReasoningEffort reports whether the model accepts Responses API
@@ -1677,8 +1739,7 @@ func xaiCollectOutputItemDone(eventData []byte, outputItemsByIndex map[int64][]b
 
 func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]byte, outputItemsFallback [][]byte) []byte {
 	outputResult := gjson.GetBytes(eventData, "response.output")
-	shouldPatchOutput := (!outputResult.Exists() || !outputResult.IsArray() || len(outputResult.Array()) == 0) && (len(outputItemsByIndex) > 0 || len(outputItemsFallback) > 0)
-	if !shouldPatchOutput {
+	if len(outputItemsByIndex) == 0 && len(outputItemsFallback) == 0 {
 		return eventData
 	}
 
@@ -1690,11 +1751,27 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 		return indexes[i] < indexes[j]
 	})
 
-	outputArray := []byte("[]")
 	var buf bytes.Buffer
 	buf.WriteByte('[')
 	wrote := false
+	currentOutput := outputResult.Array()
+	usedIndexes := make(map[int64]bool, len(outputItemsByIndex))
+	for i, item := range currentOutput {
+		raw := []byte(item.Raw)
+		if replacement, ok := outputItemsByIndex[int64(i)]; ok {
+			raw = replacement
+			usedIndexes[int64(i)] = true
+		}
+		if wrote {
+			buf.WriteByte(',')
+		}
+		buf.Write(raw)
+		wrote = true
+	}
 	for _, idx := range indexes {
+		if idx < int64(len(currentOutput)) || usedIndexes[idx] {
+			continue
+		}
 		if wrote {
 			buf.WriteByte(',')
 		}
@@ -1709,6 +1786,7 @@ func xaiPatchCompletedOutput(eventData []byte, outputItemsByIndex map[int64][]by
 		wrote = true
 	}
 	buf.WriteByte(']')
+	outputArray := []byte("[]")
 	if wrote {
 		outputArray = buf.Bytes()
 	}

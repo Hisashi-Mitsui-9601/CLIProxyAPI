@@ -64,7 +64,7 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 
 	_, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
 		Model:   "grok-4.3",
-		Payload: []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}]}`),
+		Payload: []byte(`{"model":"grok-4.3","input":[{"type":"reasoning","summary":[{"type":"summary_text","text":"test"}],"content":null,"encrypted_content":null},{"type":"reasoning","summary":[{"type":"summary_text","text":"second"}]},{"role":"user","content":"hello"}],"store":true,"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"},"tools":[{"type":"tool_search"},{"type":"image_generation"},{"type":"custom","name":"apply_patch"},{"type":"custom","name":"custom_lookup"},{"type":"function","name":"lookup"},{"type":"web_search","external_web_access":true,"search_content_types":["text","image"]},{"type":"namespace","name":"codex_app","description":"Tools in the codex_app namespace.","tools":[{"type":"function","name":"automation_update"},{"type":"custom","name":"namespace_custom"},{"type":"tool_search"}]}]}`),
 	}, cliproxyexecutor.Options{
 		SourceFormat: sdktranslator.FormatOpenAIResponse,
 		Stream:       false,
@@ -96,6 +96,9 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	}
 	if !gjson.GetBytes(gotBody, "stream").Bool() {
 		t.Fatalf("stream = false, want true; body=%s", string(gotBody))
+	}
+	if !gjson.GetBytes(gotBody, "store").Bool() {
+		t.Fatalf("store = false, want true; body=%s", string(gotBody))
 	}
 	if gjson.GetBytes(gotBody, "reasoning.effort").String() != "high" {
 		t.Fatalf("reasoning.effort = %q, want high; body=%s", gjson.GetBytes(gotBody, "reasoning.effort").String(), string(gotBody))
@@ -159,10 +162,63 @@ func TestXAIExecutorExecuteShapesResponsesRequest(t *testing.T) {
 	if !foundNamespaceCustom {
 		t.Fatalf("namespace custom tool was not moved to top-level tools; body=%s", string(gotBody))
 	}
-	for _, include := range gjson.GetBytes(gotBody, "include").Array() {
-		if include.String() == "reasoning.encrypted_content" {
-			t.Fatalf("xai request must not ask for encrypted reasoning content: %s", string(gotBody))
+	includes := gjson.GetBytes(gotBody, "include").Array()
+	if len(includes) != 1 || includes[0].String() != "reasoning.encrypted_content" {
+		t.Fatalf("include = %s, want [reasoning.encrypted_content]; body=%s", gjson.GetBytes(gotBody, "include").Raw, string(gotBody))
+	}
+}
+
+func TestXAIExecutorExecutePreservesStoreAndFinalEncryptedReasoningContent(t *testing.T) {
+	finalEncryptedContent := testValidGrokEncryptedContentForSeed(9)
+	var gotBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var errRead error
+		gotBody, errRead = io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
 		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(`data: {"type":"response.output_item.done","output_index":0,"item":{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"secret-thinking"}],"encrypted_content":"` + finalEncryptedContent + `"}}` + "\n"))
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"resp_1","object":"response","created_at":0,"status":"completed","model":"grok-4.5-build","store":false,"output":[{"id":"rs_1","type":"reasoning","status":"completed","summary":[{"type":"summary_text","text":"secret-thinking"}]},{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"391","annotations":[],"logprobs":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	resp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"What is 17 * 23? Answer briefly."}],"store":true,"include":["reasoning.encrypted_content"],"reasoning":{"effort":"high"}}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+
+	if !gjson.GetBytes(gotBody, "store").Bool() {
+		t.Fatalf("upstream request store = false, want true; body=%s", string(gotBody))
+	}
+	includes := gjson.GetBytes(gotBody, "include").Array()
+	if len(includes) != 1 || includes[0].String() != "reasoning.encrypted_content" {
+		t.Fatalf("upstream include = %s, want [reasoning.encrypted_content]; body=%s", gjson.GetBytes(gotBody, "include").Raw, string(gotBody))
+	}
+	if got := gjson.GetBytes(resp.Payload, "store").Bool(); !got {
+		t.Fatalf("response store = false, want true; payload=%s", string(resp.Payload))
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.0.encrypted_content").String(); got != finalEncryptedContent {
+		t.Fatalf("response output.0.encrypted_content = %q, want %q; payload=%s", got, finalEncryptedContent, string(resp.Payload))
+	}
+	if got := gjson.GetBytes(resp.Payload, "output.1.content.0.text").String(); got != "391" {
+		t.Fatalf("response output.1.content.0.text = %q, want 391; payload=%s", got, string(resp.Payload))
 	}
 }
 
