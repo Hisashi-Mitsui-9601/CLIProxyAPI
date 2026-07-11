@@ -859,6 +859,7 @@ func (e *XAIExecutor) prepareResponsesRequestTo(ctx context.Context, req cliprox
 	body = normalizeXAIInputReasoningItems(body)
 	body = sanitizeXAIInputEncryptedContent(body)
 	body = normalizeCodexInstructions(body)
+	body = normalizeXAIPreviousResponseContinuation(body)
 	body = sanitizeXAIResponsesBody(body, baseModel)
 
 	sessionID, errSession := xaiResolveComposerSessionID(ctx, req, opts, baseModel)
@@ -1488,6 +1489,18 @@ func restoreXAIResponsesSourceRequestFields(body, originalPayload []byte, from s
 			body = updated
 		}
 	}
+	if previousResponseID := strings.TrimSpace(req.Get("previous_response_id").String()); previousResponseID != "" {
+		updated, errSet := sjson.SetBytes(body, "previous_response_id", previousResponseID)
+		if errSet == nil {
+			body = updated
+		}
+		if gjson.GetBytes(body, "instructions").Exists() {
+			updated, errDel := sjson.DeleteBytes(body, "instructions")
+			if errDel == nil {
+				body = updated
+			}
+		}
+	}
 	return body
 }
 
@@ -1537,6 +1550,19 @@ func xaiPatchCompletedResponseRequestFields(eventData, originalPayload []byte, f
 		}
 	}
 	return eventData
+}
+
+func normalizeXAIPreviousResponseContinuation(body []byte) []byte {
+	if strings.TrimSpace(gjson.GetBytes(body, "previous_response_id").String()) == "" {
+		return body
+	}
+	if gjson.GetBytes(body, "instructions").Exists() {
+		updated, errDel := sjson.DeleteBytes(body, "instructions")
+		if errDel == nil {
+			return updated
+		}
+	}
+	return body
 }
 
 // xaiSupportsReasoningEffort reports whether the model accepts Responses API

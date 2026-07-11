@@ -222,6 +222,76 @@ func TestXAIExecutorExecutePreservesStoreAndFinalEncryptedReasoningContent(t *te
 	}
 }
 
+func TestXAIExecutorExecutePreservesPreviousResponseIDForStoredResponses(t *testing.T) {
+	var bodies [][]byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, errRead := io.ReadAll(r.Body)
+		if errRead != nil {
+			t.Fatalf("read body: %v", errRead)
+		}
+		bodies = append(bodies, body)
+		w.Header().Set("Content-Type", "text/event-stream")
+		responseID := "resp_1"
+		if len(bodies) > 1 {
+			responseID = "resp_2"
+		}
+		_, _ = w.Write([]byte(`data: {"type":"response.completed","response":{"id":"` + responseID + `","object":"response","created_at":0,"status":"completed","model":"grok-4.5-build","output":[{"id":"msg_1","type":"message","status":"completed","role":"assistant","content":[{"type":"output_text","text":"ok","annotations":[],"logprobs":[]}]}],"usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}}}` + "\n\n"))
+	}))
+	defer server.Close()
+
+	exec := NewXAIExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		Provider: "xai",
+		Attributes: map[string]string{
+			"base_url":  server.URL,
+			"auth_kind": "oauth",
+		},
+		Metadata: map[string]any{"access_token": "xai-token"},
+	}
+
+	firstResp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"first"}],"store":true}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("first Execute() error = %v", err)
+	}
+	firstID := gjson.GetBytes(firstResp.Payload, "id").String()
+	if firstID != "resp_1" {
+		t.Fatalf("first response id = %q, want resp_1; payload=%s", firstID, string(firstResp.Payload))
+	}
+
+	secondResp, err := exec.Execute(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "grok-4.5",
+		Payload: []byte(`{"model":"grok-4.5","input":[{"role":"user","content":"second"}],"store":true,"previous_response_id":"` + firstID + `","instructions":"system prompt"}`),
+	}, cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAIResponse,
+		Stream:       false,
+	})
+	if err != nil {
+		t.Fatalf("second Execute() error = %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("upstream request count = %d, want 2", len(bodies))
+	}
+	secondBody := bodies[1]
+	if got := gjson.GetBytes(secondBody, "previous_response_id").String(); got != firstID {
+		t.Fatalf("upstream previous_response_id = %q, want %q; body=%s", got, firstID, string(secondBody))
+	}
+	if !gjson.GetBytes(secondBody, "store").Bool() {
+		t.Fatalf("upstream store = false, want true; body=%s", string(secondBody))
+	}
+	if gjson.GetBytes(secondBody, "instructions").Exists() {
+		t.Fatalf("instructions must be omitted when previous_response_id is set: %s", string(secondBody))
+	}
+	if got := gjson.GetBytes(secondResp.Payload, "id").String(); got != "resp_2" {
+		t.Fatalf("second response id = %q, want resp_2; payload=%s", got, string(secondResp.Payload))
+	}
+}
+
 func TestXAIExecutorComposerSessionIsolation(t *testing.T) {
 	exec := NewXAIExecutor(&config.Config{})
 	auth := &cliproxyauth.Auth{
